@@ -1,11 +1,14 @@
-import { useRef, useState, useCallback } from 'react';
+import { useRef, useState, useCallback, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Camera, Upload, Mountain, Sun, Waves, TreePalm, Loader2, Scan, Sparkles } from 'lucide-react';
 
 // =============================================================
-//  PASTE YOUR TEACHABLE MACHINE MODEL LINK HERE
+//  Model files are in /public/tm-model/:
+//    - model.json (model topology + weights manifest)
+//    - metadata.json (class labels)
+//    - weights.bin (model weights — binary file, replace with your trained weights)
 // =============================================================
-const MODEL_URL = 'YOUR_URL_HERE';
+const MODEL_URL = '/tm-model/';
 // =============================================================
 
 type Category = {
@@ -34,12 +37,43 @@ function TeachableMachine() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const modelRef = useRef<any>(null);
 
   const [mode, setMode] = useState<Mode>('idle');
   const [uploadedImage, setUploadedImage] = useState<string | null>(null);
   const [predictions, setPredictions] = useState<Prediction[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [modelLoading, setModelLoading] = useState(false);
+  const [modelReady, setModelReady] = useState(false);
+  const [modelError, setModelError] = useState<string | null>(null);
+
+  // Load model on mount
+  useEffect(() => {
+    let cancelled = false;
+    async function loadModel() {
+      setModelLoading(true);
+      setModelError(null);
+      try {
+        const tmImage = await import('@teachablemachine/image');
+        await import('@tensorflow/tfjs');
+        const modelURL = `${MODEL_URL}model.json`;
+        const metadataURL = `${MODEL_URL}metadata.json`;
+        const model = await tmImage.load(modelURL, metadataURL);
+        if (cancelled) return;
+        modelRef.current = model;
+        setModelReady(true);
+      } catch (err) {
+        if (cancelled) return;
+        console.error('Model load error:', err);
+        setModelError('تعذر تحميل النموذج. تأكد من وجود ملفات النموذج في المجلد الصحيح.');
+      } finally {
+        if (!cancelled) setModelLoading(false);
+      }
+    }
+    loadModel();
+    return () => { cancelled = true; };
+  }, []);
 
   const stopCamera = useCallback(() => {
     if (streamRef.current) {
@@ -80,51 +114,34 @@ function TeachableMachine() {
     reader.readAsDataURL(file);
   }, [stopCamera]);
 
-  // Mock classification — replace with real Teachable Machine model loading
   const runPrediction = useCallback(async () => {
+    if (!modelRef.current) {
+      setError('النموذج غير جاهز بعد. يرجى الانتظار.');
+      return;
+    }
     setLoading(true);
     setError(null);
     setPredictions(null);
 
     try {
-      if (MODEL_URL === 'YOUR_URL_HERE') {
-        // Mock prediction logic when no model URL is provided
-        await new Promise((r) => setTimeout(r, 1800));
-        const categoryNames = Object.keys(CATEGORIES);
-        const shuffled = [...categoryNames].sort(() => Math.random() - 0.5);
-        const probs = [0.72, 0.15, 0.08, 0.05];
-        const mockPredictions: Prediction[] = shuffled.map((name, i) => ({
-          className: name,
-          probability: probs[i],
-        }));
-        setPredictions(mockPredictions);
+      const model = modelRef.current;
+      const maxPredictions = model.getMaxPredictions?.() ?? 4;
+
+      let imageElement: HTMLImageElement | HTMLVideoElement;
+      if (mode === 'camera' && videoRef.current) {
+        imageElement = videoRef.current;
+      } else if (mode === 'image' && imageRef.current) {
+        imageElement = imageRef.current;
       } else {
-        // Real Teachable Machine model — dynamically imported to avoid bundling issues
-        const tmImage = await import('@teachablemachine/image');
-        const tf = await import('@tensorflow/tfjs');
-
-        const modelURL = `${MODEL_URL}model.json`;
-        const metadataURL = `${MODEL_URL}metadata.json`;
-        const model = await tmImage.load(modelURL, metadataURL);
-        const maxPredictions = (model as any).getMaxPredictions?.() ?? 4;
-
-        let imageElement: HTMLImageElement | HTMLVideoElement;
-        if (mode === 'camera' && videoRef.current) {
-          imageElement = videoRef.current;
-        } else if (mode === 'image' && imageRef.current) {
-          imageElement = imageRef.current;
-        } else {
-          throw new Error('لا يوجد صورة للتعرّف عليها');
-        }
-
-        const results: Prediction[] = await model.predict(imageElement, maxPredictions);
-        setPredictions(
-          results
-            .map((r: any) => ({ className: r.className, probability: r.probability }))
-            .sort((a: Prediction, b: Prediction) => b.probability - a.probability)
-        );
-        (tf as any).disposeVars();
+        throw new Error('لا يوجد صورة للتعرّف عليها');
       }
+
+      const results: Prediction[] = await model.predict(imageElement, maxPredictions);
+      setPredictions(
+        results
+          .map((r: any) => ({ className: r.className, probability: r.probability }))
+          .sort((a: Prediction, b: Prediction) => b.probability - a.probability)
+      );
     } catch (err) {
       setError('حدث خطأ أثناء التعرّف على الصورة. حاول مرة أخرى.');
       console.error(err);
@@ -132,6 +149,18 @@ function TeachableMachine() {
       setLoading(false);
     }
   }, [mode]);
+
+  // Auto-predict on camera frames
+  const [autoPredict, setAutoPredict] = useState(false);
+  useEffect(() => {
+    if (!autoPredict || !modelRef.current || mode !== 'camera') return;
+    const interval = setInterval(() => {
+      if (videoRef.current && modelRef.current && !loading) {
+        runPrediction();
+      }
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [autoPredict, mode, loading, runPrediction]);
 
   const topPrediction = predictions?.[0];
   const topCategory = topPrediction ? CATEGORIES[topPrediction.className] : null;
@@ -163,6 +192,25 @@ function TeachableMachine() {
           <p className="text-saudi-sand/70 text-lg max-w-2xl mx-auto">
             استخدم الكاميرا أو ارفع صورة، ودع الذكاء الاصطناعي يكتشف ما إذا كانت الجبال، الصحراء، البحار، أو النخيل
           </p>
+
+          {/* Model status */}
+          {modelLoading && (
+            <div className="mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-full bg-saudi-gold/10 border border-saudi-gold/20">
+              <Loader2 className="w-4 h-4 text-saudi-gold animate-spin" />
+              <span className="text-saudi-gold-light text-sm">جاري تحميل النموذج...</span>
+            </div>
+          )}
+          {modelReady && (
+            <div className="mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-full bg-green-500/10 border border-green-400/20">
+              <span className="w-2 h-2 rounded-full bg-green-400" />
+              <span className="text-green-300 text-sm">النموذج جاهز</span>
+            </div>
+          )}
+          {modelError && (
+            <div className="mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-full bg-red-500/10 border border-red-400/20">
+              <span className="text-red-300 text-sm">{modelError}</span>
+            </div>
+          )}
         </motion.div>
 
         {/* Controls */}
@@ -205,17 +253,32 @@ function TeachableMachine() {
           />
 
           {mode !== 'idle' && (
-            <button
-              onClick={() => {
-                stopCamera();
-                setMode('idle');
-                setUploadedImage(null);
-                setPredictions(null);
-              }}
-              className="px-6 py-4 rounded-2xl font-bold bg-red-900/40 border border-red-500/30 text-red-300 hover:bg-red-900/60 transition-all"
-            >
-              إغلاق
-            </button>
+            <>
+              {mode === 'camera' && modelReady && (
+                <button
+                  onClick={() => setAutoPredict((p) => !p)}
+                  className={`px-6 py-4 rounded-2xl font-bold transition-all ${
+                    autoPredict
+                      ? 'bg-saudi-green-light text-white'
+                      : 'bg-saudi-green/30 border border-saudi-gold/30 text-white hover:bg-saudi-green'
+                  }`}
+                >
+                  {autoPredict ? 'إيقاف التعرّف التلقائي' : 'تعرّف تلقائي'}
+                </button>
+              )}
+              <button
+                onClick={() => {
+                  stopCamera();
+                  setMode('idle');
+                  setAutoPredict(false);
+                  setUploadedImage(null);
+                  setPredictions(null);
+                }}
+                className="px-6 py-4 rounded-2xl font-bold bg-red-900/40 border border-red-500/30 text-red-300 hover:bg-red-900/60 transition-all"
+              >
+                إغلاق
+              </button>
+            </>
           )}
         </motion.div>
 
@@ -245,6 +308,7 @@ function TeachableMachine() {
                     ref={imageRef}
                     src={uploadedImage}
                     alt="الصورة المرفوعة"
+                    crossOrigin="anonymous"
                     className="w-full h-full object-cover"
                   />
                 )}
@@ -254,6 +318,14 @@ function TeachableMachine() {
                   <div className="absolute inset-0 bg-saudi-green-dark/60 flex flex-col items-center justify-center gap-3 backdrop-blur-sm">
                     <Loader2 className="w-10 h-10 text-saudi-gold animate-spin" />
                     <span className="text-saudi-gold-light font-bold">جاري التعرّف...</span>
+                  </div>
+                )}
+
+                {/* Auto-predict badge */}
+                {autoPredict && mode === 'camera' && !loading && (
+                  <div className="absolute top-3 right-3 flex items-center gap-2 px-3 py-1.5 rounded-full bg-saudi-green-dark/70 backdrop-blur-sm">
+                    <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
+                    <span className="text-green-300 text-xs font-bold">تعرّف مباشر</span>
                   </div>
                 )}
 
@@ -359,10 +431,11 @@ function TeachableMachine() {
                 )}
 
                 {/* Run button */}
-                {!loading && (
+                {!loading && !autoPredict && (
                   <button
                     onClick={runPrediction}
-                    className="mt-4 flex items-center justify-center gap-2 px-6 py-3 rounded-xl font-bold bg-saudi-gold text-saudi-green-dark hover:bg-saudi-gold-light transition-all shadow-lg shadow-saudi-gold/20"
+                    disabled={!modelReady}
+                    className="mt-4 flex items-center justify-center gap-2 px-6 py-3 rounded-xl font-bold bg-saudi-gold text-saudi-green-dark hover:bg-saudi-gold-light transition-all shadow-lg shadow-saudi-gold/20 disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     <Sparkles className="w-5 h-5" />
                     ابدأ التعرّف
